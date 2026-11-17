@@ -157,6 +157,12 @@ func (dh *decryptionHandle) validate() error {
 	return nil
 }
 
+// decryptingReader decrypts the encrypted message with the configured key material.
+// The message and the encrypted detached signature are wrapped in resettable readers,
+// because the decryption methods (session keys, key ring, passwords) are tried one after
+// another, as well as multiple candidates within a method. Every attempt consumes part of
+// the input stream, so each of them has to start at the beginning of the stream.
+// The buffered data is released as soon as the successful method is known.
 func (dh *decryptionHandle) decryptingReader(encryptedMessage Reader, encryptedSignature Reader, encoding int8) (plainMessageReader *VerifyDataReader, err error) {
 	err = dh.validate()
 	if err != nil {
@@ -174,6 +180,8 @@ func (dh *decryptionHandle) decryptingReader(encryptedMessage Reader, encryptedS
 		}
 		encryptedMessage = armoredBlock.Body
 	}
+	messageReader := newResetReader(encryptedMessage, dh.needsRewind())
+	var signatureReader *internal.ResetReader
 	if encryptedSignature != nil {
 		encryptedSignature, armored = unarmorInput(encoding, encryptedSignature)
 		if armored {
@@ -193,33 +201,46 @@ func (dh *decryptionHandle) decryptingReader(encryptedMessage Reader, encryptedS
 				return nil, err
 			}
 		}
+		signatureReader = newResetReader(encryptedSignature, dh.needsRewind())
 	}
 
 	var decryptionTried bool
 	if len(dh.SessionKeys) > 0 {
 		// Decrypt with session key.
-		if encryptedSignature != nil {
-			plainMessageReader, err = dh.decryptStreamAndVerifyDetached(encryptedMessage, encryptedSignature, dh.PlainDetachedSignature)
+		if signatureReader != nil {
+			plainMessageReader, err = dh.decryptStreamAndVerifyDetached(messageReader, signatureReader, dh.PlainDetachedSignature)
 		} else {
-			plainMessageReader, err = dh.decryptStreamWithSession(encryptedMessage)
+			plainMessageReader, err = dh.decryptStreamWithSession(messageReader)
 		}
 		decryptionTried = true
 	}
 	if (!decryptionTried || err != nil) && dh.DecryptionKeyRing != nil {
-		// Decrypt with keyring.
-		if encryptedSignature != nil {
-			plainMessageReader, err = dh.decryptStreamAndVerifyDetached(encryptedMessage, encryptedSignature, dh.PlainDetachedSignature)
+		// Decrypt with keyring. Resets the streams to the beginning if a previous
+		// method has consumed part of the input.
+		if decryptionTried {
+			if err = rewindInputs(messageReader, signatureReader); err != nil {
+				return nil, err
+			}
+		}
+		if signatureReader != nil {
+			plainMessageReader, err = dh.decryptStreamAndVerifyDetached(messageReader, signatureReader, dh.PlainDetachedSignature)
 		} else {
-			plainMessageReader, err = dh.decryptStream(encryptedMessage)
+			plainMessageReader, err = dh.decryptStream(messageReader)
 		}
 		decryptionTried = true
 	}
 	if (!decryptionTried || err != nil) && len(dh.Passwords) > 0 {
-		// Decrypt with password.
-		if encryptedSignature != nil {
-			plainMessageReader, err = dh.decryptStreamAndVerifyDetached(encryptedMessage, encryptedSignature, dh.PlainDetachedSignature)
+		// Decrypt with password. Resets the streams to the beginning if a previous
+		// method has consumed part of the input.
+		if decryptionTried {
+			if err = rewindInputs(messageReader, signatureReader); err != nil {
+				return nil, err
+			}
+		}
+		if signatureReader != nil {
+			plainMessageReader, err = dh.decryptStreamAndVerifyDetached(messageReader, signatureReader, dh.PlainDetachedSignature)
 		} else {
-			plainMessageReader, err = dh.decryptStream(encryptedMessage)
+			plainMessageReader, err = dh.decryptStream(messageReader)
 		}
 		decryptionTried = true
 	}
@@ -230,10 +251,72 @@ func (dh *decryptionHandle) decryptingReader(encryptedMessage Reader, encryptedS
 	if err != nil {
 		return nil, err
 	}
+	// A decryption method succeeded and is not retried anymore, so the input
+	// streams do not have to be resettable and the buffered ciphertext can be
+	// released. The plaintext is read from the stream lazily.
+	messageReader.DisableBuffering()
+	if signatureReader != nil {
+		signatureReader.DisableBuffering()
+	}
 	if dh.IsUTF8 {
 		plainMessageReader.internalReader = internal.NewSanitizeReader(plainMessageReader.internalReader)
 	}
 	return plainMessageReader, nil
+}
+
+// needsRewind reports whether the input stream may have to be reset while decrypting.
+// This is the case if more than one decryption method is configured, if a method tries
+// more than one candidate, or if a candidate has to be read twice to verify it (see
+// decryptStreamWithSessionAndParse). In all other cases the stream is decrypted in a
+// single pass and does not have to be buffered.
+func (dh *decryptionHandle) needsRewind() bool {
+	methodCount := 0
+	if len(dh.SessionKeys) > 0 {
+		methodCount++
+	}
+	if dh.DecryptionKeyRing != nil {
+		methodCount++
+	}
+	if len(dh.Passwords) > 0 {
+		methodCount++
+	}
+	if methodCount > 1 {
+		return true
+	}
+	switch {
+	case len(dh.SessionKeys) > 0:
+		// A candidate is verified completely before it is selected if another
+		// candidate or another method could still be tried.
+		return len(dh.SessionKeys) > 1
+	case len(dh.Passwords) > 0:
+		return len(dh.Passwords) > 1
+	}
+	return false
+}
+
+// newResetReader wraps the input stream in a resettable reader. If rewinding is
+// not needed, buffering is disabled, so that no copy of the ciphertext is kept
+// in memory. Reporters reset the stream to the beginning only if they actually
+// have to try more than one candidate, so a lookup for a single candidate is a
+// single pass read.
+func newResetReader(reader Reader, rewind bool) *internal.ResetReader {
+	if rewind {
+		return internal.NewResetReader(reader)
+	}
+	return internal.NewNonBufferingResetReader(reader)
+}
+
+// rewindInputs resets the message and signature stream to their beginning.
+func rewindInputs(messageReader *internal.ResetReader, signatureReader *internal.ResetReader) error {
+	if err := rewindReader(messageReader); err != nil {
+		return err
+	}
+	if signatureReader != nil {
+		if err := rewindReader(signatureReader); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func isPGPSplitReader(w Reader) PGPSplitReader {

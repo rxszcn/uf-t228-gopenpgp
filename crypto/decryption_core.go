@@ -33,8 +33,30 @@ func NewPGPSplitReader(pgpMessage Reader, pgpEncryptedSignature Reader) *pgpSpli
 	}
 }
 
+// rewindReader resets a resettable input stream to its beginning.
+func rewindReader(reader *internal.ResetReader) error {
+	if _, err := reader.Reset(); err != nil {
+		// Should not happen, since buffering is only disabled after a successful
+		// decryption that is not retried anymore.
+		return fmt.Errorf("gopenpgp: buffer reset failed: %w", err)
+	}
+	return nil
+}
+
+// verifyDecryptedCompletely reads the whole decrypted message, which triggers
+// the integrity check of the encrypted data packet (MDC for SEIPD v1, AEAD tag
+// for SEIPD v2) and the parsing of all trailing packets. It returns an error if
+// the data packet was not decrypted correctly, i.e. if the session key or
+// password was wrong. Signature verification errors are not reported here.
+func verifyDecryptedCompletely(md *openpgp.MessageDetails) error {
+	_, err := io.Copy(io.Discard, md.UnverifiedBody)
+	return err
+}
+
 // decryptStream decrypts the stream either with the secret keys or a password.
-func (dh *decryptionHandle) decryptStream(encryptedMessage Reader) (plainMessage *VerifyDataReader, err error) {
+// The message reader has to be resettable, so that the password candidates can
+// be tried one after another, each starting at the beginning of the message.
+func (dh *decryptionHandle) decryptStream(encryptedMessage *internal.ResetReader) (plainMessage *VerifyDataReader, err error) {
 	var entries openpgp.EntityList
 
 	config := dh.decryptionConfig(dh.clock().Unix())
@@ -60,19 +82,40 @@ func (dh *decryptionHandle) decryptStream(encryptedMessage Reader) (plainMessage
 	} else {
 		// Password based decryption
 		var foundPassword = false
-		resetReader := internal.NewResetReader(encryptedMessage)
-		for _, password := range dh.Passwords {
+		// Same argument as for the session key candidates above: a wrong password
+		// is only reliably detected when the decrypted data has been read to the
+		// end, so the password has to be verified completely before it is selected
+		// if another password candidate could still be tried.
+		verifyCompletely := len(dh.Passwords) > 1
+		for i, password := range dh.Passwords {
+			if i > 0 {
+				// Every candidate has to start at the beginning of the message,
+				// because the previous candidate consumed its headers.
+				if err := rewindReader(encryptedMessage); err != nil {
+					return nil, err
+				}
+			}
 			prompt := createPasswordPrompt(password)
-			messageDetails, err = openpgp.ReadMessage(resetReader, entries, prompt, config)
-			if err == nil {
-				foundPassword = true
-				resetReader.DisableBuffering()
-				break
+			messageDetails, err = openpgp.ReadMessage(encryptedMessage, entries, prompt, config)
+			if err != nil {
+				continue
 			}
-			if _, err := resetReader.Reset(); err != nil {
-				// Should not happen.
-				return nil, fmt.Errorf("gopenpgp: buffer reset failed: %w", err)
+			if verifyCompletely {
+				if err = verifyDecryptedCompletely(messageDetails); err != nil {
+					continue
+				}
+				// The password is correct; open the message once more to read the
+				// plaintext as a stream.
+				if err := rewindReader(encryptedMessage); err != nil {
+					return nil, err
+				}
+				messageDetails, err = openpgp.ReadMessage(encryptedMessage, entries, createPasswordPrompt(password), config)
+				if err != nil {
+					return nil, fmt.Errorf("gopenpgp: decrypting message with password failed: %w", err)
+				}
 			}
+			foundPassword = true
+			break
 		}
 		if !foundPassword {
 			// Parsing errors when reading the message are most likely caused by incorrect password, but we cannot know for sure
@@ -101,7 +144,7 @@ func (dh *decryptionHandle) decryptStream(encryptedMessage Reader) (plainMessage
 	}, nil
 }
 
-func (dh *decryptionHandle) decryptStreamWithSession(dataPacketReader Reader) (plainMessage *VerifyDataReader, err error) {
+func (dh *decryptionHandle) decryptStreamWithSession(dataPacketReader *internal.ResetReader) (plainMessage *VerifyDataReader, err error) {
 	messageDetails, verifyTime, err := dh.decryptStreamWithSessionAndParse(dataPacketReader)
 	if err != nil {
 		return nil, fmt.Errorf("gopenpgp: error in reading message: %w", err)
@@ -128,21 +171,25 @@ func (dh *decryptionHandle) decryptStreamWithSession(dataPacketReader Reader) (p
 	}, err
 }
 
-func (dh *decryptionHandle) decryptStreamWithSessionAndParse(messageReader io.Reader) (*openpgp.MessageDetails, int64, error) {
+// decryptStreamWithSessionAndParse tries the configured session key candidates
+// one after another. Every attempt starts at the beginning of the message stream:
+// an attempt consumes the packet headers (and part of the ciphertext) of the
+// message, so the stream has to be rewound before the next candidate is tried.
+// The first attempt that decrypts the data packet *and* yields a parseable
+// message is selected; only then buffering is disabled so that the plaintext
+// can be read as a stream.
+func (dh *decryptionHandle) decryptStreamWithSessionAndParse(messageReader *internal.ResetReader) (*openpgp.MessageDetails, int64, error) {
 	var keyring openpgp.EntityList
 	var decrypted io.ReadCloser
 	var selectedSessionKey *SessionKey
+	var md *openpgp.MessageDetails
 	var err error
-	// Read symmetrically encrypted data packet
-	for _, sessionKeyCandidate := range dh.SessionKeys {
-		decrypted, err = decryptStreamWithSessionKey(sessionKeyCandidate, messageReader)
-		if err == nil { // No error occurred
-			selectedSessionKey = sessionKeyCandidate
-			break
-		}
+
+	if dh.VerifyKeyRing != nil {
+		keyring = append(keyring, dh.VerifyKeyRing.entities...)
 	}
-	if selectedSessionKey == nil {
-		return nil, 0, fmt.Errorf("gopenpgp: unable to decrypt message with session key: %w", err)
+	if dh.DecryptionKeyRing != nil {
+		keyring = append(keyring, dh.DecryptionKeyRing.entities...)
 	}
 
 	config := dh.decryptionConfig(dh.clock().Unix())
@@ -153,17 +200,70 @@ func (dh *decryptionHandle) decryptStreamWithSessionAndParse(messageReader io.Re
 		config.KnownNotations = map[string]bool{constants.SignatureContextName: true}
 	}
 
-	// Push decrypted packet as literal packet and use openpgp's reader
-	if dh.VerifyKeyRing != nil {
-		keyring = append(keyring, dh.VerifyKeyRing.entities...)
+	// Try the session key candidates. The stream is rewound before every
+	// attempt, because a failed attempt may have consumed the stream headers.
+	//
+	// Opening the data packet does not prove that the session key is correct:
+	// the integrity check of SEIPD v1 (MDC) and v2 (AEAD tag) is only performed
+	// once the decrypted data has been read to the end. If another candidate or
+	// another decryption method could still be tried, a candidate whose garbage
+	// plaintext happens to parse as a valid packet would be selected and would
+	// hide the correct one. Therefore the candidate is verified completely
+	// before it is selected in that case, and reopened afterwards for streaming.
+	verifyCompletely := len(dh.SessionKeys) > 1 || dh.DecryptionKeyRing != nil || len(dh.Passwords) > 0
+	for i, sessionKeyCandidate := range dh.SessionKeys {
+		if i > 0 {
+			// Every candidate has to start at the beginning of the message,
+			// because the previous candidate consumed its headers.
+			if err := rewindReader(messageReader); err != nil {
+				return nil, 0, err
+			}
+		}
+		decrypted, err = decryptStreamWithSessionKey(sessionKeyCandidate, messageReader)
+		if err != nil {
+			continue
+		}
+		// A wrong session key is not detected while opening the packet stream in
+		// all cases, in particular not for SEIPD v1. Parsing the decrypted
+		// packets detects such a candidate, before it is selected.
+		md, err = openpgp.ReadMessage(decrypted, keyring, nil, config)
+		if err != nil {
+			_ = decrypted.Close()
+			decrypted = nil
+			continue
+		}
+		if verifyCompletely {
+			if err = verifyDecryptedCompletely(md); err != nil {
+				_ = decrypted.Close()
+				decrypted = nil
+				continue
+			}
+			// Reopen the selected candidate, so that the plaintext can still be
+			// read as a stream by the caller.
+			if err = rewindReader(messageReader); err != nil {
+				return nil, 0, err
+			}
+			decrypted, err = decryptStreamWithSessionKey(sessionKeyCandidate, messageReader)
+			if err != nil {
+				continue
+			}
+			md, err = openpgp.ReadMessage(decrypted, keyring, nil, config)
+			if err != nil {
+				_ = decrypted.Close()
+				decrypted = nil
+				continue
+			}
+		}
+		selectedSessionKey = sessionKeyCandidate
+		break
 	}
-	if dh.DecryptionKeyRing != nil {
-		keyring = append(keyring, dh.DecryptionKeyRing.entities...)
+	if selectedSessionKey == nil {
+		if err == nil {
+			err = errors.New("gopenpgp: no session key candidates provided")
+		}
+		return nil, 0, fmt.Errorf("gopenpgp: unable to decrypt message with session key: %w", err)
 	}
-	md, err := openpgp.ReadMessage(decrypted, keyring, nil, config)
-	if err != nil {
-		return nil, 0, fmt.Errorf("gopenpgp: unable to decode symmetric packet: %w", err)
-	}
+
 	md.SessionKey = selectedSessionKey.Key
 	md.UnverifiedBody = checkReader{decrypted, md.UnverifiedBody}
 	return md, config.Time().Unix(), nil
@@ -214,11 +314,13 @@ Loop:
 	return decrypted, nil
 }
 
-func (dh *decryptionHandle) decryptStreamAndVerifyDetached(encryptedData, encryptedSignature Reader, isPlaintextSignature bool) (plainMessage *VerifyDataReader, err error) {
+func (dh *decryptionHandle) decryptStreamAndVerifyDetached(encryptedData, encryptedSignature *internal.ResetReader, isPlaintextSignature bool) (plainMessage *VerifyDataReader, err error) {
 	verifyTime := dh.clock().Unix()
 	var mdData *openpgp.MessageDetails
-	signature := encryptedSignature
-	// Decrypt both messages
+	var signature io.Reader = encryptedSignature
+	// Decrypt both messages. The signature stream is rewound by the caller's
+	// decryption attempts, just like the data stream, so each method always starts
+	// at the beginning of the respective input.
 	if len(dh.SessionKeys) > 0 {
 		// Decrypt with session key.
 		mdData, _, err = dh.decryptStreamWithSessionAndParse(encryptedData)
@@ -243,19 +345,39 @@ func (dh *decryptionHandle) decryptStreamAndVerifyDetached(encryptedData, encryp
 		// Decrypting reader for the encrypted data
 		var selectedPassword []byte
 		if len(dh.Passwords) > 0 {
-			resetReader := internal.NewResetReader(encryptedData)
-			for _, passwordCandidate := range dh.Passwords {
-				prompt := createPasswordPrompt(passwordCandidate)
-				mdData, err = openpgp.ReadMessage(resetReader, entries, prompt, config)
-				if err == nil { // No error occurred
-					selectedPassword = passwordCandidate
-					resetReader.DisableBuffering()
-					break
+			// Same argument as in decryptStream: a wrong password is only
+			// reliably detected when the decrypted data has been read to the end,
+			// so a password has to be verified completely before it is selected if
+			// another password candidate could still be tried.
+			verifyCompletely := len(dh.Passwords) > 1
+			for i, passwordCandidate := range dh.Passwords {
+				if i > 0 {
+					// Every candidate has to start at the beginning of the message,
+					// because the previous candidate consumed its headers.
+					if err := rewindReader(encryptedData); err != nil {
+						return nil, err
+					}
 				}
-				if _, err := resetReader.Reset(); err != nil {
-					// Should not happen
-					return nil, fmt.Errorf("gopenpgp: buffer reset failed: %w", err)
+				mdData, err = openpgp.ReadMessage(encryptedData, entries, createPasswordPrompt(passwordCandidate), config)
+				if err != nil {
+					continue
 				}
+				if verifyCompletely {
+					if err = verifyDecryptedCompletely(mdData); err != nil {
+						continue
+					}
+					// The password is correct; open the message once more to read
+					// the plaintext as a stream.
+					if err := rewindReader(encryptedData); err != nil {
+						return nil, err
+					}
+					mdData, err = openpgp.ReadMessage(encryptedData, entries, createPasswordPrompt(passwordCandidate), config)
+					if err != nil {
+						return nil, fmt.Errorf("gopenpgp: decrypting message with password failed: %w", err)
+					}
+				}
+				selectedPassword = passwordCandidate
+				break
 			}
 			if selectedPassword == nil {
 				return nil, fmt.Errorf("gopenpgp: error in reading data message: no password matched: %w", err)
